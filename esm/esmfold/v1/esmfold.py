@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch import nn
 from torch.nn import LayerNorm
+import torch.nn.functional as F
 
 import esm
 from esm import Alphabet
@@ -133,6 +134,10 @@ class ESMFold(nn.Module):
             repr_layers=range(self.esm.num_layers + 1),
             need_head_weights=self.cfg.use_esm_attn_map,
         )
+
+        if not self.esm.is_last_stage():
+            return None,None
+        
         esm_s = torch.stack(
             [v for _, v in sorted(res["representations"].items())], dim=2
         )
@@ -190,6 +195,9 @@ class ESMFold(nn.Module):
 
         esm_s, esm_z = self._compute_language_model_representations(esmaa)
 
+        if not self.esm.is_last_stage():
+            return None,None
+        
         # Convert esm_s to the precision used by the trunk and
         # the structure module. These tensors may be a lower precision if, for example,
         # we're running the language model in fp16 precision.
@@ -206,6 +214,12 @@ class ESMFold(nn.Module):
             s_z_0 = self.esm_z_mlp(esm_z)
         else:
             s_z_0 = s_s_0.new_zeros(B, L, L, self.cfg.trunk.pairwise_state_dim)
+
+        target_dim_size = aa.size(1)
+        source_dim_size = s_s_0.size(1)
+        padding_size = target_dim_size - source_dim_size
+        if padding_size > 0:
+            s_s_0 = F.pad(s_s_0, (0, 0, 0, padding_size,0,0))
 
         s_s_0 += self.embedding(aa)
 
@@ -326,6 +340,9 @@ class ESMFold(nn.Module):
             masking_pattern=masking_pattern,
             num_recycles=num_recycles,
         )
+        
+        if not self.esm.is_last_stage():
+            return None
 
         output["atom37_atom_exists"] = output[
             "atom37_atom_exists"

@@ -81,6 +81,56 @@ except ImportError:
     from torch.nn import LayerNorm as ESM1bLayerNorm
 
 
+class TransformerBlockPipe(TransformerLayer):
+    def __init__(
+        self,
+        layer_idx,
+        embed_dim,
+        ffn_embed_dim,
+        attention_heads,
+        add_bias_kv=True,
+        use_esm1b_layer_norm=False,
+        use_rotary_embeddings: bool = False,
+    ):
+        super().__init__(embed_dim, ffn_embed_dim, attention_heads, add_bias_kv, use_esm1b_layer_norm, use_rotary_embeddings)
+        self.layer_idx = layer_idx
+
+    def forward(self,inputs):
+        
+        # x, self_attn_mask, self_attn_padding_mask, need_head_weights, hidden_representations, attn_weights, repr_layers = inputs
+        x, padding_mask_or_zero, repr_layers_tensor, need_head_weights_tag, hidden_representations_tensor, attn_weights_tensor = inputs
+        # inputs是一个元组
+        if need_head_weights_tag.dim() == 0 and need_head_weights_tag.item() == 1:
+            need_head_weights = True
+        else:
+            need_head_weights = False
+        
+        if padding_mask_or_zero.dim() == 0 and padding_mask_or_zero.item() == 0:
+            padding_mask_or_none = None
+        else:
+            padding_mask_or_none = padding_mask_or_zero
+
+        x, attn = super().forward(x=x, self_attn_mask=None, self_attn_padding_mask=padding_mask_or_none, need_head_weights=need_head_weights)# 调用内部的transformer层的输出
+        
+        if torch.any(repr_layers_tensor==(self.layer_idx+1)):
+            hidden_representations_tensor[self.layer_idx+1] = x.transpose(0, 1)
+        
+        if need_head_weights:
+            attn_weights_tensor[self.layer_idx] = attn.transpose(1, 0)   
+        
+        # if (self.layer_idx + 1) in repr_layers:
+        #     hidden_representations[self.layer_idx + 1] = x.transpose(0, 1)
+        # if need_head_weights:
+        #     attn_weights.append(attn.transpose(1, 0))
+
+        return (x.contiguous(), 
+                padding_mask_or_zero.contiguous(), 
+                repr_layers_tensor.contiguous(), 
+                need_head_weights_tag.contiguous(), 
+                hidden_representations_tensor.contiguous(), 
+                attn_weights_tensor.contiguous())
+
+
 class TransformerLayer(nn.Module):
     """Transformer layer block."""
 

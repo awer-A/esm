@@ -8,8 +8,9 @@ import torch
 import torch.nn as nn
 
 import esm
-from esm.modules import ContactPredictionHead, ESM1bLayerNorm, RobertaLMHead, TransformerLayer
-
+from esm.modules import ContactPredictionHead, ESM1bLayerNorm, RobertaLMHead, TransformerLayer, TransformerBlockPipe
+import deepspeed
+from deepspeed.pipe import PipelineModule
 
 class ESM2(nn.Module):
     def __init__(
@@ -35,6 +36,7 @@ class ESM2(nn.Module):
         self.prepend_bos = alphabet.prepend_bos
         self.append_eos = alphabet.append_eos
         self.token_dropout = token_dropout
+        self.gpu_num = 4 #流水线并行度
 
         self._init_submodules()
 
@@ -46,9 +48,9 @@ class ESM2(nn.Module):
             padding_idx=self.padding_idx,
         )
 
-        self.layers = nn.ModuleList(
-            [
-                TransformerLayer(
+        pipe_transformers_list= [
+                TransformerBlockPipe(
+                    layer_idx,
                     self.embed_dim,
                     4 * self.embed_dim,
                     self.attention_heads,
@@ -56,9 +58,19 @@ class ESM2(nn.Module):
                     use_esm1b_layer_norm=True,
                     use_rotary_embeddings=True,
                 )
-                for _ in range(self.num_layers)
+                for layer_idx in range(self.num_layers)
             ]
-        )
+        self.layers = nn.ModuleList(pipe_transformers_list)
+        self.pipe_transformer = PipelineModule(pipe_transformers_list, num_stages=self.gpu_num) 
+        
+        ds_config = {
+                # "train_batch_size": self.gpu_num,
+                "train_micro_batch_size_per_gpu":1, 
+                 "fp16": {
+                     "enabled": True},
+                }
+        # 初始化deepspeed引擎
+        self.pipe_engine, _, _, _ = deepspeed.initialize(model=self.pipe_transformer, config=ds_config) 
 
         self.contact_head = ContactPredictionHead(
             self.num_layers * self.attention_heads,
@@ -108,26 +120,35 @@ class ESM2(nn.Module):
         if not padding_mask.any():
             padding_mask = None
 
-        for layer_idx, layer in enumerate(self.layers):
-            x, attn = layer(
-                x,
-                self_attn_padding_mask=padding_mask,
-                need_head_weights=need_head_weights,
-            )
-            if (layer_idx + 1) in repr_layers:
-                hidden_representations[layer_idx + 1] = x.transpose(0, 1)
-            if need_head_weights:
-                # (H, B, T, T) => (B, H, T, T)
-                attn_weights.append(attn.transpose(1, 0))
+        def _get_data_iter():
+            micro_x_list = torch.chunk(x, self.gpu_num, dim=1)
+            repr_layers_tensor = torch.tensor(list(repr_layers))
+            need_head_weights_tag = torch.tensor(1) if need_head_weights else torch.tensor(0)
+            T,B,E = x.shape
+            hidden_representations_tensor = torch.zeros(self.num_layers +1, B, T, E)
+            if 0 in repr_layers:
+                hidden_representations_tensor[0] = x.transpose(0, 1)
+            attn_weights_tensor = torch.zeros(self.num_layers, B, T, T)
+            padding_mask_or_zero = torch.tensor(0) if padding_mask is None else padding_mask
+
+            yield((x,padding_mask_or_zero,repr_layers_tensor,need_head_weights_tag,hidden_representations_tensor,attn_weights_tensor),0)
+
+        #丢到流水线的模型中进行计算
+        outputs = self.pipe_engine.eval_batch(_get_data_iter(), compute_loss=False, reduce_output=None)
+        # x, _, _, _, hidden_representations_tensor, attn_weights_tensor= self.pipe_engine.eval_batch(_get_data_iter(), compute_loss=False, reduce_output=None)
+         # 调用deepspeed引擎进行计算
+
+        if not self.is_last_stage():
+            return
+        
+        x, _, _, _, hidden_representations_tensor, attn_weights_tensor = outputs[0]
+        hidden_representations = {idx:hidden_representations_tensor[idx] for idx in repr_layers}
+        attn_weights = torch.chunk(attn_weights_tensor, self.num_layers, dim=0)
 
         x = self.emb_layer_norm_after(x)
         x = x.transpose(0, 1)  # (T, B, E) => (B, T, E)
 
-        # last hidden representation should have layer norm applied
-        if (layer_idx + 1) in repr_layers:
-            hidden_representations[layer_idx + 1] = x
         x = self.lm_head(x)
-
         result = {"logits": x, "representations": hidden_representations}
         if need_head_weights:
             # attentions: B x L x H x T x T
@@ -145,3 +166,5 @@ class ESM2(nn.Module):
 
     def predict_contacts(self, tokens):
         return self(tokens, return_contacts=True)["contacts"]
+    def is_last_stage(self):
+        return self.pipe_engine.stage_id == self.gpu_num - 1
