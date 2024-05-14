@@ -65,12 +65,12 @@ def init_model_on_gpu_with_cpu_offloading(model):
 
 
 def create_batched_sequence_datasest(
-    sequences: T.List[T.Tuple[str, str]], max_tokens_per_batch: int = 1024
+    sequences: T.List[T.Tuple[str, str]], batch_size: int=1 # 设置batch_size :一次读入batch_size条序列
 ) -> T.Generator[T.Tuple[T.List[str], T.List[str]], None, None]:
 
     batch_headers, batch_sequences, num_tokens = [], [], 0
     for header, seq in sequences:
-        if (len(seq) + num_tokens > max_tokens_per_batch) and num_tokens > 0:
+        if len(batch_sequences) == batch_size:
             yield batch_headers, batch_sequences
             batch_headers, batch_sequences, num_tokens = [], [], 0
         batch_headers.append(header)
@@ -118,8 +118,14 @@ def create_parser():
         "result in lower memory usage at the cost of speed. Recommended values: 128, 64, 32. "
         "Default: None.",
     )
-    parser.add_argument("--cpu-only", help="CPU only", action="store_true")
-    parser.add_argument("--cpu-offload", help="Enable CPU offloading", action="store_true")
+    parser.add_argument(
+        "--device_ids",
+        type=int,
+        default=None,
+        help="Devide IDs to use data parallel. ",
+        nargs= '+'
+    ) # 在这里进行确定数据并行的GPU编号
+
     return parser
 
 
@@ -153,8 +159,11 @@ def run(args):
     elif args.cpu_offload:
         model = init_model_on_gpu_with_cpu_offloading(model)
     else:
-        model.cuda()
-        model = DataParallelESMFold(model)
+        if args.device_ids is None:
+            model.cuda()
+        else:
+            model.to(torch.device('cuda', args.device_ids[0]))
+        model = DataParallelESMFold(model, device_ids = args.device_ids) 
     logger.info("Starting Predictions")
     batched_sequences = create_batched_sequence_datasest(all_sequences, args.max_tokens_per_batch)
 

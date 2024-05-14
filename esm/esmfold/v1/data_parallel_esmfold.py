@@ -15,9 +15,9 @@ from esm.esmfold.v1.misc import (
 
 class DataParallelESMFold():
     def __init__(self, model: ESMFold, device_ids=None):
-        self._device = model.device
-        self._device_ids = device_ids
-        self._model = torch.nn.DataParallel(model, device_ids).eval()
+        self._device = torch.device("cuda", device_ids[0]) if device_ids is not None else torch.device("cuda")
+        self._model = torch.nn.DataParallel(model, device_ids)
+        self._device_ids = self._model.device_ids
 
     def infer(
         self,
