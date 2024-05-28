@@ -22,6 +22,3 @@ pipe.model = deepspeed.init_inference(
     mp_size=world_size,
     dtype=torch.float,
 )
-
-output = pipe(['MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVLGYNIVATPRGYVLAGG', 'MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVLGYNIVATPRGYVLAGG'])
-print(output)
